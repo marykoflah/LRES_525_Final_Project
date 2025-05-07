@@ -1,0 +1,167 @@
+// ===== STEP 1: AOI from Shapefile =====
+var AOI = ee.FeatureCollection("projects/ee-marykoflaherty/assets/Absaroka_Beartooth");
+Map.centerObject(AOI, 9);
+
+// ===== STEP 2: UI Dropdowns =====
+var yearSelect = ui.Select({
+  items: ['2020', '2021', '2022', '2023'],
+  placeholder: 'Select Year',
+  onChange: updateMap
+});
+var seasonSelect = ui.Select({
+  items: ['Spring', 'Winter'],
+  placeholder: 'Select Season',
+  onChange: updateMap
+});
+var panel = ui.Panel([ui.Label('SNOTEL Snow & Vegetation Viewer'), yearSelect, seasonSelect]);
+Map.add(panel);
+
+// ===== STEP 3: SNOTEL Stations =====
+var snotelStations = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([-110.25, 45.27]), {name: 'Box Canyon', elevation: 2033}),
+  ee.Feature(ee.Geometry.Point([-109.25, 45.24]), {name: 'Burnt Mountain', elevation: 1792}),
+  ee.Feature(ee.Geometry.Point([-109.35, 45.19]), {name: 'Cole Creek', elevation: 2393}),
+  ee.Feature(ee.Geometry.Point([-110.08, 45.5]), {name: 'East Boulder', elevation: 1931}),
+  ee.Feature(ee.Geometry.Point([-109.94, 45.06]), {name: 'Fisher Creek', elevation: 2774}),
+  ee.Feature(ee.Geometry.Point([-110.24, 45.22]), {name: 'Monument Peak', elevation: 2697}),
+  ee.Feature(ee.Geometry.Point([-110.01, 45.01]), {name: 'Northeast Entrance', elevation: 2240}),
+  ee.Feature(ee.Geometry.Point([-110.09, 45.42]), {name: 'Placer Basin', elevation: 2691}),
+  ee.Feature(ee.Geometry.Point([-109.91, 45.05]), {name: 'White Mill', elevation: 2652})
+]);
+Map.addLayer(snotelStations, {color: 'red'}, 'SNOTEL Stations');
+
+// ===== STEP 4: Buffers and Sentinel-2 Setup (Updated to 5 km) =====
+var snotelBuffers = snotelStations.map(function(f) {
+  return f.buffer(5000);  // ✅ 5 km buffer
+});
+Map.addLayer(snotelBuffers, {color: 'blue'}, '5km Buffers');
+
+function maskClouds(image) {
+  var qa = image.select('QA60');
+  return image.updateMask(qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0)))
+              .divide(10000);
+}
+
+function addIndices(image) {
+  var ndsi = image.normalizedDifference(['B3', 'B11']).rename('NDSI');
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands([ndsi, ndvi]);
+}
+
+function getImageCollection(year, season) {
+  var start, end;
+  if (season === 'Winter') {
+    start = ee.Date.fromYMD(year - 1, 12, 1);
+    end = ee.Date.fromYMD(year, 2, 28);
+  } else if (season === 'Spring') {
+    start = ee.Date.fromYMD(year, 3, 1);
+    end = ee.Date.fromYMD(year, 5, 31);
+  }
+  return ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(AOI)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskClouds)
+    .map(addIndices);
+}
+
+// ===== STEP 5: Update and Export Stats =====
+var ndsiVis = {min: 0, max: 1, palette: ['blue', 'white']};
+var ndviVis = {min: 0, max: 1, palette: ['brown', 'green']};
+
+function updateMap() {
+  Map.layers().reset();
+  Map.addLayer(snotelStations, {color: 'red'}, 'SNOTEL Stations');
+  Map.addLayer(snotelBuffers, {color: 'blue'}, '5km Buffers');
+
+  var year = parseInt(yearSelect.getValue());
+  var season = seasonSelect.getValue();
+  if (!year || !season) return;
+
+  var collection = getImageCollection(year, season);
+  var median = collection.median().clip(AOI);
+  Map.addLayer(median.select('NDSI'), ndsiVis, 'NDSI');
+  Map.addLayer(median.select('NDVI'), ndviVis, 'NDVI');
+
+  var dem = ee.Image('USGS/SRTMGL1_003').clip(AOI);
+  var combined = median.addBands(dem.rename('elevation'));
+
+  var stats = combined.select(['NDVI', 'NDSI', 'elevation']).reduceRegions({
+    collection: snotelBuffers.map(function(f) {
+      return f.set({ name: f.get('name'), elevation_m: f.get('elevation') });
+    }),
+    reducer: ee.Reducer.mean(),
+    scale: 30
+  });
+
+  stats = stats.map(function(f) {
+    var name = f.get('name');
+    var ndsi = ee.Algorithms.If(f.get('NDSI_mean'), ee.Number(f.get('NDSI_mean')).format('%.2f'), 'N/A');
+    var ndvi = ee.Algorithms.If(f.get('NDVI_mean'), ee.Number(f.get('NDVI_mean')).format('%.2f'), 'N/A');
+    var elev = ee.Algorithms.If(f.get('elevation_mean'), ee.Number(f.get('elevation_mean')).format('%.0f'), 'N/A');
+    return f.set('label', ee.String(name).cat(' | NDSI: ').cat(ndsi).cat(' | NDVI: ').cat(ndvi).cat(' | Elev: ').cat(elev));
+  });
+
+  print('SNOTEL Buffer Stats:', stats);
+
+  Export.table.toDrive({
+    collection: stats,
+    description: 'SNOTEL_Buffer_Stats_5km',
+    fileFormat: 'CSV'
+  });
+}
+
+updateMap();
+
+// //===== OPTIONAL: EXPORT ALL YEARS (2020–2023) AND SEASONS TO A COMBINED CSV =====//
+// // This block generates and merges stats for all year-season combinations
+// // Uncomment to run full export
+
+// var allExports = [];  // Store all stats
+
+// ['2020', '2021', '2022', '2023'].forEach(function(yearStr) {
+//   var year = parseInt(yearStr);
+//   ['Spring', 'Winter'].forEach(function(season) {
+
+//     var start = (season === 'Winter') ? ee.Date.fromYMD(year - 1, 12, 1) : ee.Date.fromYMD(year, 3, 1);
+//     var end   = (season === 'Winter') ? ee.Date.fromYMD(year, 2, 28)     : ee.Date.fromYMD(year, 5, 31);
+
+//     var collection = ee.ImageCollection('COPERNICUS/S2_SR')
+//       .filterBounds(AOI)
+//       .filterDate(start, end)
+//       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+//       .map(maskClouds)
+//       .map(addIndices);
+
+//     var median = collection.median().clip(AOI);
+//     var dem = ee.Image('USGS/SRTMGL1_003').clip(AOI);
+//     var combined = median.addBands(dem.rename('elevation'));
+
+//     var stats = combined.select(['NDVI', 'NDSI', 'elevation']).reduceRegions({
+//       collection: snotelBuffers.map(function(f) {
+//         return f.set({ name: f.get('name'), elevation_m: f.get('elevation') });
+//       }),
+//       reducer: ee.Reducer.mean(),
+//       scale: 30
+//     });
+
+//     stats = stats.map(function(f) {
+//       return f.set({
+//         year: yearStr,
+//         season: season,
+//         ndvi: f.get('NDVI_mean'),
+//         ndsi: f.get('NDSI_mean'),
+//         elev: f.get('elevation_mean')
+//       });
+//     });
+
+//     allExports.push(stats);
+//   });
+// });
+
+// var flatList = ee.FeatureCollection(allExports).flatten();
+// Export.table.toDrive({
+//   collection: flatList,
+//   description: 'SNOTEL_Buffer_Stats_AllYears',
+//   fileFormat: 'CSV'
+// });
